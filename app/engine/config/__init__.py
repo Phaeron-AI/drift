@@ -1,3 +1,3 @@
-from .schema import HybridConfig
+from .schema import HybridConfig, verify_environment
 
-__all__ = ["HybridConfig"]
+__all__ = ["HybridConfig", "verify_environment"]
