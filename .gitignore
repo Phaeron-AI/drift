@@ -1,0 +1,10 @@
+# Python Bytecode
+*.pyc
+__pycache__/
+
+# Virutal Environment
+venv/
+.venv/
+
+# VSCODE Native
+.vscode/
