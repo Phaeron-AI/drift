@@ -9,3 +9,6 @@ venv/
 
 # Python Bytecode
 __pycache__/
+
+# Saved Model Weights
+saved/
