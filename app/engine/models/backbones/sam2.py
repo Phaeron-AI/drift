@@ -38,7 +38,7 @@ class FrozenSam2(nn.Module):
     )
     self.predictor = SAM2ImagePredictor(model)
 
-    self.predictor.model.to(dtype=cfg.compute_dtype)
+    # self.predictor.model.to(dtype=cfg.compute_dtype)
 
     self._freeze()
 
