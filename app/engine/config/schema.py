@@ -17,9 +17,11 @@ class HybridConfig:
   vae_dtype: torch.dtype = torch.bfloat16
 
   # Models and Checkpoints (TBD)
-  # sam2_config_path: str = ""
-  # sam2_checkpoint_path: str = ""
-  # diffusion_model_id: str = ""
+  sam2_config_path: str = ""
+  sam2_checkpoint_path: str = ""
+  vae_model_id: str = ""
+  unet_model_id: str = ""
+  ddpm_model_id: str = ""
 
   # Spatial Dimensions
   img_size: int = 512
