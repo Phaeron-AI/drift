@@ -6,39 +6,29 @@ import torch.nn.functional as F
 from torch import Tensor
 
 class MaskToBias(nn.Module):
-  def __init__(self, latent_size: int, n_heads: int, n_text: int, n_traj: int)-> None:
+  def __init__(self, latent_size: int, n_heads: int, n_traj: int) -> None:   # n_text dropped from __init__
     super().__init__()
     self.latent_size = latent_size
     self.n_heads = n_heads
-    self.n_text = n_text
     self.n_traj = n_traj
 
     self.proj = nn.Linear(1, self.n_heads)
-
     nn.init.zeros_(self.proj.weight)
     nn.init.zeros_(self.proj.bias)
-  
-  def forward(self, mask: Tensor)-> Tensor:
-    B, _, _, _ = mask.shape
+
+  def forward(self, mask: Tensor, n_text: int) -> Tensor:      # n_text now a runtime arg
+    B = mask.shape[0]
     S_q = self.latent_size * self.latent_size
-    S_kv = self.n_text + self.n_traj
+    S_kv = n_text + self.n_traj                                # tracks the ACTUAL context
 
     latent_mask = F.interpolate(
-      mask,
-      size=(self.latent_size, self.latent_size),
-      mode="area"
+      mask, size=(self.latent_size, self.latent_size), mode="area"
     )
-
     latent_mask_flat = latent_mask.view(B, 1, S_q).transpose(1, 2)
-
-    head_bias = self.proj(latent_mask_flat).permute(0, 2, 1).unsqueeze(-1)
+    head_bias = self.proj(latent_mask_flat).permute(0, 2, 1).unsqueeze(-1)  # [B, n_heads, S_q, 1]
 
     full_bias = torch.zeros(
-      (B, self.n_heads, S_q, S_kv), 
-      device=mask.device, 
-      dtype=mask.dtype
+      (B, self.n_heads, S_q, S_kv), device=mask.device, dtype=mask.dtype
     )
-
-    full_bias[:, :, :, self.n_text : self.n_text + self.n_traj] = head_bias
-
+    full_bias[:, :, :, n_text : n_text + self.n_traj] = head_bias
     return full_bias
