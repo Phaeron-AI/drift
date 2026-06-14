@@ -15,6 +15,7 @@ class HybridConfig:
   device: str = "cuda"
   compute_dtype: torch.dtype = torch.bfloat16
   vae_dtype: torch.dtype = torch.bfloat16
+  torch.backends.cudnn.enabled = False
 
   # Models and Checkpoints
   sam2_config_path: str = "configs/sam2.1/sam2.1_hiera_b+.yaml"
