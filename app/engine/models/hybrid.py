@@ -30,8 +30,9 @@ class HybridSpatialDiffusion(nn.Module):
       n_traj=n_traj,
     )
 
-    self.traj_encoder.to(device=cfg.device, dtype=cfg.compute_dtype)
-    self.mask_biases.to(device=cfg.device, dtype=cfg.compute_dtype)
+    self.to(cfg.device)
+    self.traj_encoder.to(dtype=cfg.compute_dtype)
+    self.mask_biases.to(dtype=cfg.compute_dtype)
 
     self._log_trainable()
 
