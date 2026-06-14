@@ -5,8 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+
 class MaskToBias(nn.Module):
-  def __init__(self, latent_size: int, n_heads: int, n_traj: int) -> None:   # n_text dropped from __init__
+  def __init__(self, latent_size: int, n_heads: int, n_traj: int) -> None:
     super().__init__()
     self.latent_size = latent_size
     self.n_heads = n_heads
@@ -16,10 +17,12 @@ class MaskToBias(nn.Module):
     nn.init.zeros_(self.proj.weight)
     nn.init.zeros_(self.proj.bias)
 
-  def forward(self, mask: Tensor, n_text: int) -> Tensor:      # n_text now a runtime arg
+  def forward(self, mask: Tensor, n_text: int) -> Tensor:
+    mask = mask.to(self.proj.weight.dtype)
+
     B = mask.shape[0]
     S_q = self.latent_size * self.latent_size
-    S_kv = n_text + self.n_traj                                # tracks the ACTUAL context
+    S_kv = n_text + self.n_traj
 
     latent_mask = F.interpolate(
       mask, size=(self.latent_size, self.latent_size), mode="area"

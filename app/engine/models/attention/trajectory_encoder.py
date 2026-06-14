@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+
 class TrajectoryEncoder(nn.Module):
-  def __init__(self, embed_dim: int = 768, num_freqs: int = 8, n_tokens: int = 1)-> None:
+  def __init__(self, embed_dim: int = 768, num_freqs: int = 8, n_tokens: int = 1) -> None:
     super().__init__()
     self.embed_dim = embed_dim
     self.num_freqs = num_freqs
@@ -18,25 +19,22 @@ class TrajectoryEncoder(nn.Module):
     self.mlp = nn.Sequential(
       nn.Linear(in_features, embed_dim),
       nn.GELU(),
-      nn.Linear(embed_dim, out_features)
+      nn.Linear(embed_dim, out_features),
     )
 
-  
-  def forward(self, trajectory: Tensor)-> Tensor:
-    B, _ = trajectory.shape # [B, 2]
+  def forward(self, trajectory: Tensor) -> Tensor:
+    B, _ = trajectory.shape  # [B, 2]
     device = trajectory.device
-    dtype = trajectory.dtype
 
     traj = trajectory.float()
-    freq_bands = (2.0 ** torch.arange(self.num_freqs, device=device, dtype=dtype)) * math.pi
+    freq_bands = (2.0 ** torch.arange(self.num_freqs, device=device, dtype=torch.float32)) * math.pi
     scaled = traj.unsqueeze(-1) * freq_bands.view(1, 1, -1)
 
     sin_feat = torch.sin(scaled)
     cos_feat = torch.cos(scaled)
+    features = torch.cat([sin_feat, cos_feat], dim=-1).view(B, -1)  # float32
 
-    features = torch.cat([sin_feat, cos_feat], dim=-1).view(B, -1)
-
-    encoded_flat = self.mlp(features)
+    encoded_flat = self.mlp(features.to(self.mlp[0].weight.dtype))  # type: ignore
     tokens = encoded_flat.view(B, self.n_tokens, self.embed_dim)
 
     return tokens
