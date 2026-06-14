@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,3 +99,90 @@ class SpatialProcessor:
     out = out / attn.rescale_output_factor
 
     return out
+
+def install_spatial_processors(
+  unet: nn.Module,
+  traj_encoder: TrajectoryEncoder,
+  target_latent_sizes: tuple[int, ...] = (8, 16, 32),   # FIX 1: builtin tuple, no typing.Tuple
+  n_traj: int = 1,
+) -> nn.ModuleDict:
+  """
+  Installs SpatialProcessor on cross-attention (attn2) blocks at the target resolutions,
+  each backed by a per-block MaskToBias. Returns a ModuleDict of those MaskToBias modules.
+  THE CALLER MUST store the return value on an nn.Module or the params never train.
+  """
+  # Resolve the object that actually exposes attn_processors / set_attn_processor.
+  # After get_peft_model, `unet` is a PeftModel; depending on the PEFT version its attribute
+  # proxy may or may not forward these UNet methods. Prefer the wrapper if it has them
+  # (so LoRA stays in the call path for any real forward), else fall back to the base UNet.
+  if hasattr(unet, "attn_processors") and hasattr(unet, "set_attn_processor"):
+    proc_host = unet
+  elif hasattr(unet, "base_model"):
+    proc_host = unet.base_model.model
+  else:
+    raise AttributeError(
+      "Could not find attn_processors on the U-Net or its PEFT base. "
+      f"Got type {type(unet)}; inspect it and point proc_host at the real UNet2DConditionModel."
+    )
+
+  # --- 1. discover each attn2 block's latent_size via a dry-run forward ---
+  # We can't read resolution from the module name reliably, so we observe it: hook every
+  # cross-attn module, run one dummy forward, record the sequence length S_q it receives,
+  # and derive latent_size = sqrt(S_q). Robust across architecture/resolution changes.
+  latent_sizes: dict[str, int] = {}
+  hooks = []
+
+  def make_hook(name):
+    def hook(module, args, kwargs):
+      hs = args[0] if args else kwargs.get("hidden_states")
+      latent_sizes[name] = int(round(math.sqrt(hs.shape[1])))   # [B, S_q, C] -> sqrt(S_q)
+    return hook
+
+  cross_attn_names = [
+    n[: -len(".processor")]
+    for n in proc_host.attn_processors.keys()
+    if n.endswith("attn2.processor")
+  ]
+
+  for name in cross_attn_names:
+    module = proc_host.get_submodule(name)
+    hooks.append(module.register_forward_pre_hook(make_hook(name), with_kwargs=True))
+
+  # Dry-run forward purely to trigger the hooks. We run on the BASE model (LoRA bypassed) --
+  # fine, because we only intercept SHAPES here, not outputs. The hooked modules are the same
+  # objects either way (PEFT wraps in-place), so the hooks fire regardless.
+  target_model = unet.base_model.model if hasattr(unet, "base_model") else unet
+  try:
+    first_param = next(target_model.parameters())
+    dev, dt = first_param.device, first_param.dtype
+  except StopIteration:
+    dev, dt = torch.device("cpu"), torch.float32
+
+  z = torch.zeros(1, 4, 64, 64, device=dev, dtype=dt)        # standard SD1.5 latent
+  t = torch.zeros(1, device=dev, dtype=torch.long)
+  ctx = torch.zeros(1, 77, 768, device=dev, dtype=dt)        # dummy text context
+  with torch.no_grad():
+    target_model(z, t, encoder_hidden_states=ctx)
+
+  for h in hooks:
+    h.remove()
+
+  # --- 2. build + install processors on the target blocks ---
+  new_procs = dict(proc_host.attn_processors)   # start from current -> untouched blocks keep theirs
+  mask_modules = nn.ModuleDict()
+
+  for name in cross_attn_names:
+    ls = latent_sizes.get(name)
+    if ls is None:
+      print(f"Warning: could not determine latent size for {name}; skipping.")
+      continue
+    if ls not in target_latent_sizes:
+      continue                                  # e.g. skip the 64x64 block
+
+    attn = proc_host.get_submodule(name)
+    mtb = MaskToBias(latent_size=ls, n_heads=attn.heads, n_traj=n_traj)  # FIX 2: no n_text (runtime arg)
+    new_procs[name + ".processor"] = SpatialProcessor(traj_encoder, mtb, n_traj=n_traj)
+    mask_modules[name.replace(".", "_")] = mtb  # ModuleDict keys can't contain '.'
+
+  proc_host.set_attn_processor(new_procs)
+  return mask_modules
