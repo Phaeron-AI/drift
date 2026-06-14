@@ -55,6 +55,7 @@ class HybridSpatialDiffusion(nn.Module):
     timestep: Tensor,                # [B]
     trajectory: Tensor,              # [B, 2]   (normalized to [-1, 1])
     mask: Tensor,                    # [B, 1, H, W]
+    source_latent: Tensor,
     text_embeds: Optional[Tensor] = None,
   ) -> Tensor:
     if text_embeds is None:
@@ -65,8 +66,10 @@ class HybridSpatialDiffusion(nn.Module):
         dtype=noisy_latents.dtype,
       )
 
+    unet_input = torch.cat([noisy_latents, source_latent], dim=1) 
+
     noise_pred = self.backbone.unet(
-      noisy_latents,
+      unet_input,
       timestep,
       encoder_hidden_states=text_embeds,
       cross_attention_kwargs={"trajectory": trajectory, "mask": mask},
