@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-def mask_aware_reconstruction_loss(
+def l1_l2_reconstruction_loss(
   noise_pred: Tensor,        # [B, C, h, w]
   noise_target: Tensor,      # [B, C, h, w]
   mask: Tensor,              # [B, 1, H, W]  
