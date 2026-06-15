@@ -8,3 +8,6 @@ venv/
 
 # VSCODE Native
 .vscode/
+
+# Cache Directories
+cache/
