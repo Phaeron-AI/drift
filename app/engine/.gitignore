@@ -12,3 +12,7 @@ __pycache__/
 
 # Saved Model Weights
 saved/
+checkpoints/
+
+# Cache Directories
+cache/
