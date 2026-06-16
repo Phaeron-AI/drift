@@ -91,3 +91,34 @@ class FrozenSam2(nn.Module):
       )
 
     return final_mask_tensor
+
+  def _ensure_video_predictor(self):
+    if self._video_predictor is None:
+      from sam2.build_sam import build_sam2_video_predictor
+
+      self._video_predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint_path, device=self.cfg.device)
+    
+    return self._video_predictor
+  
+  def propagate_object(self, frames_dir, point_xy, ann_frame_idx: int = 0, obj_id: int = 1)-> dict:
+    vp = self._ensure_video_predictor()
+    state = vp.init_state(
+      video_path=str(frames_dir),
+      offload_video_to_cpu=True,
+      offload_state_to_cpu=True,
+    )
+
+    vp.reset_state(state)
+
+    pts = np.array([point_xy], dtype=np.float32)      # [[x, y]]
+    lbls = np.array([1], dtype=np.int32)              # 1 = positive (include this region)
+    vp.add_new_points_or_box(
+      inference_state=state, frame_idx=ann_frame_idx, obj_id=obj_id, points=pts, labels=lbls
+    )
+
+    masks: dict[int, np.ndarray] = {}
+    for f_idx, _obj_ids, mask_logits in vp.propagate_in_video(state):
+      m = (mask_logits[0] > 0.0).squeeze(0).cpu().numpy()   # [H, W] bool
+      masks[int(f_idx)] = m
+    
+    return masks
