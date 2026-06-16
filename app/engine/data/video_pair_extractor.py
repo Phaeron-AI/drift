@@ -21,7 +21,7 @@ logger = logging.getLogger("drift.video_pairs")
 class PairConfig:              
   window: int = 16              
   stride: int = 16             
-  cut_threshold: float = 0.35    
+  cut_threshold: float = 0.2
   min_disp_px: float = 8.0      
   max_disp_frac: float = 0.5     
   min_mask_area_frac: float = 0.01   
