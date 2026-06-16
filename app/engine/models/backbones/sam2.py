@@ -20,6 +20,7 @@ class FrozenSam2(nn.Module):
   def __init__(self, cfg: HybridConfig) -> None:
     super().__init__()
     self.cfg = cfg
+    self._video_predictor = None
 
     self.residency_device = (
       torch.device("cpu")
@@ -96,10 +97,11 @@ class FrozenSam2(nn.Module):
     if self._video_predictor is None:
       from sam2.build_sam import build_sam2_video_predictor
 
-      self._video_predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint_path, device=self.cfg.device)
+      self._video_predictor = build_sam2_video_predictor(self.cfg.sam2_config_path, self.cfg.sam2_checkpoint_path, device=self.cfg.device)
     
     return self._video_predictor
   
+  @torch.no_grad()
   def propagate_object(self, frames_dir, point_xy, ann_frame_idx: int = 0, obj_id: int = 1)-> dict:
     vp = self._ensure_video_predictor()
     state = vp.init_state(
