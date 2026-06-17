@@ -9,7 +9,7 @@ from torch import Tensor
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler  # type: ignore[import]
 from peft import LoraConfig, get_peft_model
 
-from ....config import HybridConfig
+from ...config import HybridConfig
 
 logger = logging.getLogger("spatial_dynamics.diffusion")
 
