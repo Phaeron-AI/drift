@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from ...config.schema import HybridConfig
+from ..config.schema import HybridConfig
 from .backbones import DiffusionBackbone, FrozenSam2
 from .attention import TrajectoryEncoder, install_spatial_processors
 
