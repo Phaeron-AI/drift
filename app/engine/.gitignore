@@ -12,7 +12,16 @@ __pycache__/
 
 # Saved Model Weights
 saved/
+
+# checkpoints
 checkpoints/
+.ipynb_checkpoints/
 
 # Cache Directories
 cache/
+
+# Temporarily, all video file
+*.mp4
+
+# Datasets
+data_raw/

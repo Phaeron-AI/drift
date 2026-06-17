@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from ..losses import l1_l2_reconstruction_loss
+from ..src.losses import l1_l2_reconstruction_loss
 
 def main()-> None:
   torch.manual_seed(0)
