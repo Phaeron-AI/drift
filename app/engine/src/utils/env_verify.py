@@ -102,4 +102,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-  # D:/Phaeron/drift/app/engine/src/data_raw/DAVIS/JPEGImages/480p/bear/00000.jpg
