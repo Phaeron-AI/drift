@@ -4,10 +4,12 @@ import logging
 
 import torch
 
+# from ..config import HybridConfig, verify_environment
 from ..config import HybridConfig, verify_environment
+# from ..models.backbones.sam2 import FrozenSam2
 from ..models.backbones.sam2 import FrozenSam2
 from ..models.backbones.diffusion import DiffusionBackbone
-from .vram import VRAMManager
+from ..utils.vram import VRAMManager
 
 logger = logging.getLogger("spatial_dynamics.verify")
 
@@ -18,21 +20,21 @@ def _check_trainable_boundary(backbone: DiffusionBackbone) -> None:
     total += p.numel()
     if p.requires_grad:
       trainable += p.numel()
-      if "lora_" not in name:
+      if "lora_" not in name and "conv_in" not in name:   # conv_in (8ch) is meant to train
           non_lora.append(name)
 
   pct = 100.0 * trainable / max(total, 1)
   logger.info(f"CHECK 1  trainable={trainable:,} ({pct:.3f}% of U-Net)")
 
   assert not non_lora, (
-    f"Non-LoRA trainable params found ({len(non_lora)}); freezing/targeting is wrong. "
+    f"Non-LoRA/non-conv_in trainable params found ({len(non_lora)}); freezing/targeting is wrong. "
     f"First few: {non_lora[:5]}"
   )
   assert pct < 1.5, (
     f"Trainable share {pct:.2f}% is too high -- target_modules likely over-matched. "
-    "Expected <~1% for rank-r LoRA on the four attention projections."
+    "Expected <~1% for rank-r LoRA on the four attention projections (+ conv_in)."
   )
-  logger.info("CHECK 1 PASSED: all trainable params are LoRA factors.")
+  logger.info("CHECK 1 PASSED: all trainable params are LoRA factors (+ conv_in).")
 
 
 def _check_sam2_frozen(sam2: FrozenSam2) -> None:
@@ -100,3 +102,4 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
+  # D:/Phaeron/drift/app/engine/src/data_raw/DAVIS/JPEGImages/480p/bear/00000.jpg
