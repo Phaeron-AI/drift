@@ -17,7 +17,7 @@ logger = logging.getLogger("drift.trainer")
 
 
 class Trainer:
-  def __init__( 
+  def __init__(
     self,
     cfg: HybridConfig,
     model: HybridSpatialDiffusion,
@@ -28,6 +28,7 @@ class Trainer:
     temporal_weight: float = 0.0,
     ckpt_dir: Path = Path("checkpoints"),
     ckpt_every: int = 500,
+    ema_beta: float = 0.98,        # EMA smoothing for the logged loss (higher = smoother)
   ) -> None:
     self.cfg = cfg
     self.model = model
@@ -39,6 +40,11 @@ class Trainer:
     self.global_step = 0
     self.vram = VRAMManager(cfg)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # EMA of the loss: cancels the per-step timestep variance so the TREND is readable.
+    # raw batch-1 loss swings wildly by sampled t; the EMA is the curve you actually watch.
+    self.ema_beta = ema_beta
+    self.ema_loss: Optional[float] = None
 
     self.loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
     self.optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr)
@@ -94,9 +100,17 @@ class Trainer:
       for batch in self.loader:
         loss_val = self._step(batch)
 
+        # update EMA every step (not just on log steps) so it reflects the full history
+        if self.ema_loss is None:
+          self.ema_loss = loss_val
+        else:
+          self.ema_loss = self.ema_beta * self.ema_loss + (1.0 - self.ema_beta) * loss_val
+
         if self.global_step % 50 == 0:
           self.vram.report(f"step {self.global_step}")
-          logger.info(f"step {self.global_step} | loss {loss_val:.4f}")
+          logger.info(
+            f"step {self.global_step} | loss {loss_val:.4f} | ema {self.ema_loss:.4f}"
+          )
 
         self.global_step += 1
         if self.global_step % self.ckpt_every == 0:
@@ -106,11 +120,9 @@ class Trainer:
           break
 
     self.save_checkpoint()
-    logger.info(f"Training complete at step {self.global_step}.")
+    logger.info(f"Training complete at step {self.global_step}. final ema loss {self.ema_loss:.4f}")
 
   def save_checkpoint(self) -> None:
-    # FIX 3: save/load now share ONE key contract: global_step / model_state_dict /
-    # optimizer_state_dict. Optimizer IS saved (was missing). trainable-only state.
     path = self.ckpt_dir / f"step_{self.global_step}.pt"
     trainable_names = {n for n, p in self.model.named_parameters() if p.requires_grad}
     trainable = {k: v for k, v in self.model.state_dict().items() if k in trainable_names}
@@ -133,7 +145,7 @@ class Trainer:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
 
     missing_keys, unexpected_keys = self.model.load_state_dict(
-      checkpoint["model_state_dict"], strict=False   # strict=False: checkpoint holds only trainable subset
+      checkpoint["model_state_dict"], strict=False
     )
     if unexpected_keys:
       logger.warning(f"Found {len(unexpected_keys)} unexpected keys in checkpoint.")
