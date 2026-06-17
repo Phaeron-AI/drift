@@ -13,9 +13,11 @@ from torch import Tensor
 import torchvision.transforms.functional as TF
 
 from ..config import HybridConfig
-from ..src.models.backbones import DiffusionBackbone, FrozenSam2
+from ..models.backbones import DiffusionBackbone, FrozenSam2
+from ..data.davis_adapter import build_davis_dataset, DavisConfig
 
 logger = logging.getLogger("drift.precompute_cache")
+ENGINE_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _sample_key(sample: dict) -> str:
@@ -57,11 +59,11 @@ def _trajectory_vec(sample: dict, cfg: HybridConfig) -> tuple[float, float]:
 
 
 def build_dataset(cfg: HybridConfig) -> Iterator[dict]:
-  # TODO[dataset]: chain your real sources here. e.g.:
-  yield {
-    "source_image_path": "dummy_src.jpg", "target_image_path": "dummy_tgt.jpg",
-    "start_x": 100, "start_y": 150, "end_x": 120, "end_y": 170,
-  }
+  # DAVIS source: ground-truth centroids -> clean trajectory; precompute re-runs SAM2 at the
+  # centroid for the cached mask (train/inference consistency). Add more sources by chaining
+  # additional generators here (e.g. the video extractor for unlabeled clips).
+  davis_dir = ENGINE_ROOT / "data_raw" / "DAVIS"
+  yield from build_davis_dataset(cfg, davis_dir, DavisConfig())
 
 
 def precompute(cfg: HybridConfig, cache_dir: Path, overwrite: bool) -> None:
@@ -72,7 +74,7 @@ def precompute(cfg: HybridConfig, cache_dir: Path, overwrite: bool) -> None:
   if manifest_path.exists():
     manifest = json.loads(manifest_path.read_text())
 
-  backbone = DiffusionBackbone(cfg)        
+  backbone = DiffusionBackbone(cfg)
   backbone.to(cfg.device)
   sam2 = FrozenSam2(dataclasses.replace(cfg, sam2_residency="resident"))
 
@@ -116,7 +118,7 @@ def precompute(cfg: HybridConfig, cache_dir: Path, overwrite: bool) -> None:
 def main() -> None:
   logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
   parser = argparse.ArgumentParser(description="Precompute source/target latents + masks.")
-  parser.add_argument("--cache-dir", type=Path, default=Path("cache"))
+  parser.add_argument("--cache-dir", type=Path, default=ENGINE_ROOT / "cache")
   parser.add_argument("--overwrite", action="store_true")
   args = parser.parse_args()
   cfg = HybridConfig()
