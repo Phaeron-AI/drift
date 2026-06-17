@@ -19,7 +19,7 @@ class HybridConfig:
 
   # Models and Checkpoints
   sam2_config_path: str = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-  sam2_checkpoint_path: str = "engine/models/saved/segment_anything/sam2.1_hiera_base_plus.pt"
+  sam2_checkpoint_path: str = "engine/src/models/saved/segment_anything/sam2.1_hiera_base_plus.pt"
   vae_model_id: str = "runwayml/stable-diffusion-v1-5"
   unet_model_id: str = "runwayml/stable-diffusion-v1-5"
   ddpm_model_id: str = "runwayml/stable-diffusion-v1-5"
