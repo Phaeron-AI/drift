@@ -42,11 +42,14 @@ class DiffusionBackbone(nn.Module):
     if hasattr(self.vae.config, "scaling_factor"):
       self.vae_scaling_factor = self.vae.config.scaling_factor  # type: ignore
     else:
-      self.vae_scaling_factor = 0.18215  
+      self.vae_scaling_factor = 0.18215  # SD 1.5/2.1 default
       logger.warning(
         f"VAE scaling_factor missing; defaulting to {self.vae_scaling_factor}"
       )
 
+    # ORDER MATTERS:
+    #   _expand_conv_in BEFORE _inject_lora (operates on the raw UNet, conv_in is 4ch here)
+    #   _set_conv_in_trainable AFTER _freeze + _inject_lora (the blanket freeze disabled it)
     self._expand_conv_in()
     self._freeze()
     if cfg.enable_gradient_checkpointing:
@@ -89,14 +92,23 @@ class DiffusionBackbone(nn.Module):
       out_channels=old.out_channels,      # type: ignore
       kernel_size=old.kernel_size,        # type: ignore
       stride=old.stride,                  # type: ignore
-      padding=old.padding,                # type: ignore  (size-preserving)
+      padding=old.padding,                # type: ignore  (size-preserving; do NOT drop)
       bias=(old.bias is not None),        # type: ignore
     )
 
     with torch.no_grad():
-      new.weight.zero_()                      # all 8 channels start at 0
-      new.weight[:, :4].copy_(old.weight)     # type: ignore
-      #                                         channels 4:8 stay ZERO -> source contributes 0 at init
+      new.weight.zero_()
+      new.weight[:, :4].copy_(old.weight) # type: ignore     # channels 0:4 = pretrained noisy-latent path
+      # WARM-START the source channels (4:8) at PARITY with the noise channels (1.0x, not 0.5x).
+      # Rationale: at 0.5x init the source pathway preserved identity STATICALLY (recon test,
+      # EMA 0.03, bear=bear) but LOST it under MOTION (joint test -> bear became a generic
+      # quadruped at the trajectory-correct position). Interpretation: trajectory is a cheap
+      # low-entropy signal that the model latches onto; appearance is expensive and gets crowded
+      # out when both compete. Seeding source at full parity makes appearance compete as loudly
+      # as the noise path from step 0, so identity is less likely to be sacrificed when the
+      # object also has to move. (If parity still isn't enough -> add a mask-weighted identity
+      # loss and/or curriculum: warm-start joint training from the recon checkpoint.)
+      new.weight[:, 4:].copy_(old.weight) # type: ignore
       if old.bias is not None:                # type: ignore
         new.bias.copy_(old.bias)              # type: ignore
 
@@ -104,6 +116,7 @@ class DiffusionBackbone(nn.Module):
     self.unet.conv_in = new
 
   def _set_conv_in_trainable(self) -> None:
+    # After _inject_lora, self.unet is a PeftModel and _freeze() disabled conv_in grads.
     unet = self.unet.base_model.model if hasattr(self.unet, "base_model") else self.unet
     for p in unet.conv_in.parameters():       # type: ignore
       p.requires_grad_(True)

@@ -5,11 +5,12 @@ import dataclasses
 import json
 import logging
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 from ..config import HybridConfig
@@ -43,13 +44,15 @@ def _load_source_target_images(sample: dict, cfg: HybridConfig) -> tuple[Tensor,
     src = TF.to_tensor(src_pil).unsqueeze(0).to(cfg.device)
     tgt = TF.to_tensor(tgt_pil).unsqueeze(0).to(cfg.device)
 
-  src_norm = (src * 2.0) - 1.0      # VAE expects [-1, 1]
+  src_norm = (src * 2.0) - 1.0
   tgt_norm = (tgt * 2.0) - 1.0
   return src_norm.to(cfg.compute_dtype), tgt_norm.to(cfg.compute_dtype)
 
 
-def _grab_point(sample: dict) -> tuple[float, float]:
-  return float(sample["start_x"]), float(sample["start_y"])
+def _grab_point(sample: dict, which: str) -> tuple[float, float]:
+  if which == "source":
+    return float(sample["start_x"]), float(sample["start_y"])
+  return float(sample["end_x"]), float(sample["end_y"])
 
 
 def _trajectory_vec(sample: dict, cfg: HybridConfig) -> tuple[float, float]:
@@ -58,12 +61,19 @@ def _trajectory_vec(sample: dict, cfg: HybridConfig) -> tuple[float, float]:
   return float(dx / cfg.img_size), float(dy / cfg.img_size)
 
 
+def _sam_mask(sam2: FrozenSam2, img_pm1: Tensor, x: float, y: float, cfg: HybridConfig) -> np.ndarray:
+  # FALLBACK only -- used when a sample has no ground-truth mask (e.g. the video extractor).
+  sam_img = (img_pm1 + 1.0) / 2.0
+  prompt = torch.tensor([[x, y]], device=cfg.device, dtype=torch.float32)
+  m = sam2.predict_mask(sam_img, prompt)
+  return (m[0, 0] > 0.5).to(torch.uint8).cpu().numpy() * 255
+
+
 def build_dataset(cfg: HybridConfig) -> Iterator[dict]:
-  # DAVIS source: ground-truth centroids -> clean trajectory; precompute re-runs SAM2 at the
-  # centroid for the cached mask (train/inference consistency). Add more sources by chaining
-  # additional generators here (e.g. the video extractor for unlabeled clips).
   davis_dir = ENGINE_ROOT / "data_raw" / "DAVIS"
-  yield from build_davis_dataset(cfg, davis_dir, DavisConfig())
+  # FULL-DAVIS de-risking run: every clip, dense sampling, 12% of clips held out as val.
+  dcfg = DavisConfig(use_all_clips=True, holdout_frac=0.12, holdout_seed=0)
+  yield from build_davis_dataset(cfg, davis_dir, dcfg)
 
 
 def precompute(cfg: HybridConfig, cache_dir: Path, overwrite: bool) -> None:
@@ -76,33 +86,44 @@ def precompute(cfg: HybridConfig, cache_dir: Path, overwrite: bool) -> None:
 
   backbone = DiffusionBackbone(cfg)
   backbone.to(cfg.device)
-  sam2 = FrozenSam2(dataclasses.replace(cfg, sam2_residency="resident"))
+  sam2: Optional[FrozenSam2] = None   # built lazily ONLY if a sample lacks GT masks
 
   written, skipped = 0, 0
   for sample in build_dataset(cfg):
     try:
       key = _sample_key(sample)
       lat_path = cache_dir / "latents" / f"{key}.pt"
-      mask_path = cache_dir / "masks" / f"{key}.npy"
-      if lat_path.exists() and mask_path.exists() and not overwrite:
+      mask_path = cache_dir / "masks" / f"{key}.npy"        # SOURCE mask (model input)
+      mask_t_path = cache_dir / "masks" / f"{key}_t.npy"    # TARGET mask (loss union)
+      if lat_path.exists() and mask_path.exists() and mask_t_path.exists() and not overwrite:
         skipped += 1
         continue
 
       source_img, target_img = _load_source_target_images(sample, cfg)
-      x, y = _grab_point(sample)
-      prompt = torch.tensor([[x, y]], device=cfg.device, dtype=torch.float32)
-
-      src_lat = backbone.encode(source_img)[0].cpu()    # [4,h,w] scaled latent
+      src_lat = backbone.encode(source_img)[0].cpu()
       tgt_lat = backbone.encode(target_img)[0].cpu()
-      sam_img = (source_img + 1.0) / 2.0                # SAM2 wants [0,1]
-      mask = sam2.predict_mask(sam_img, prompt)         # [1,1,H,W]
-      mask_np = (mask[0, 0] > 0.5).to(torch.uint8).cpu().numpy() * 255
+
+      if "source_mask" in sample and "target_mask" in sample:
+        # GROUND-TRUTH masks from the adapter -- whole-object, no fragments (P-006 fix).
+        mask_s_np = sample["source_mask"]
+        mask_t_np = sample["target_mask"]
+      else:
+        # FALLBACK: no GT masks (non-DAVIS source) -> SAM at the grab points.
+        if sam2 is None:
+          sam2 = FrozenSam2(dataclasses.replace(cfg, sam2_residency="resident"))
+        sx, sy = _grab_point(sample, "source")
+        ex, ey = _grab_point(sample, "target")
+        mask_s_np = _sam_mask(sam2, source_img, sx, sy, cfg)
+        mask_t_np = _sam_mask(sam2, target_img, ex, ey, cfg)
 
       torch.save({"source": src_lat, "target": tgt_lat}, lat_path)
-      np.save(mask_path, mask_np)
+      np.save(mask_path, mask_s_np)
+      np.save(mask_t_path, mask_t_np)
 
+      sx, sy = _grab_point(sample, "source")
       tx, ty = _trajectory_vec(sample, cfg)
-      manifest[key] = {"trajectory": [tx, ty], "prompt_xy": [float(x), float(y)]}
+      manifest[key] = {"trajectory": [tx, ty], "prompt_xy": [float(sx), float(sy)],
+                       "split": sample.get("split", "train")}
       written += 1
       if written % 256 == 0:
         manifest_path.write_text(json.dumps(manifest))

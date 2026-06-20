@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
@@ -16,10 +17,8 @@ logger = logging.getLogger("drift.davis")
 
 
 CURATED_PRISTINE = (
-  # original pristine 12
   "bear", "blackswan", "boat", "camel", "car-shadow", "cows",
   "dog", "elephant", "flamingo", "goat", "rhino", "hike",
-  # added: more single-salient-object clips with real translation
   "car-turn", "drift-straight", "drift-turn", "kite-walk", "lucia",
   "mallard-fly", "mallard-water", "rollerblade", "swing", "tennis",
   "dog-agility", "horsejump-low", "scooter-gray", "soapbox", "train",
@@ -29,11 +28,14 @@ CURATED_PRISTINE = (
 
 @dataclass
 class DavisConfig:
-  frame_gap: int = 6            # source->target gap (lower than before -> more pairs/clip)
-  stride: int = 3             # step between emitted pairs (overlap -> many more pairs)
-  min_disp_px: float = 6.0        # reject near-static pairs (img_size space)
-  max_disp_frac: float = 0.6      # reject implausible jumps (occlusion swap / annotation gap)
-  clips: Optional[tuple[str, ...]] = None   # None -> CURATED_PRISTINE
+  frame_gap: int = 12           # dense full-DAVIS scaling run: moderate motion...
+  stride: int = 5              # ...with dense overlap for VOLUME across all clips
+  min_disp_px: float = 15.0       # keep real motion so the union mask stays active
+  max_disp_frac: float = 0.8
+  clips: Optional[tuple[str, ...]] = None   # None + use_all_clips=False -> CURATED_PRISTINE
+  use_all_clips: bool = False     # True -> use EVERY clip in the dataset (full-DAVIS scaling)
+  holdout_frac: float = 0.0       # fraction of CLIPS reserved as val (clip-level split)
+  holdout_seed: int = 0           # reproducible split
 
 
 def _davis_roots(cfg: HybridConfig, davis_dir: Path) -> tuple[Path, Path]:
@@ -68,6 +70,12 @@ def _centroid_scaled(mask: np.ndarray, inst: int, size: int) -> Optional[tuple[f
   return (cx, cy)
 
 
+def _instance_mask_resized(mask: np.ndarray, inst: int, size: int) -> np.ndarray:
+  binm = (mask == inst).astype(np.uint8) * 255
+  pil = Image.fromarray(binm).resize((size, size), Image.Resampling.NEAREST)
+  return np.array(pil)
+
+
 def _load_frame(path: Path, size: int) -> torch.Tensor:
   img = Image.open(path).convert("RGB")
   t = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
@@ -76,7 +84,7 @@ def _load_frame(path: Path, size: int) -> torch.Tensor:
 
 
 def extract_pairs(clip: str, jpeg_root: Path, anno_root: Path, cfg: HybridConfig,
-                  dcfg: DavisConfig) -> Iterator[dict]:
+                  dcfg: DavisConfig, split: str) -> Iterator[dict]:
   frames = sorted((jpeg_root / clip).glob("*.jpg"))
   masks = sorted((anno_root / clip).glob("*.png"))
   if len(frames) != len(masks) or len(frames) == 0:
@@ -89,28 +97,27 @@ def extract_pairs(clip: str, jpeg_root: Path, anno_root: Path, cfg: HybridConfig
     j = i + dcfg.frame_gap
     m0 = _read_mask_indices(masks[i])
     mj = _read_mask_indices(masks[j])
-
     inst = _pick_instance(m0)
     if inst is None:
       continue
     c0 = _centroid_scaled(m0, inst, size)
-    cj = _centroid_scaled(mj, inst, size)     # SAME instance index -> same object
+    cj = _centroid_scaled(mj, inst, size)
     if c0 is None or cj is None:
       continue
-
     dx, dy = cj[0] - c0[0], cj[1] - c0[1]
     disp = (dx * dx + dy * dy) ** 0.5
-    if disp < dcfg.min_disp_px:
-      continue
-    if disp > dcfg.max_disp_frac * size:
+    if disp < dcfg.min_disp_px or disp > dcfg.max_disp_frac * size:
       continue
 
     yield {
       "id": f"{clip}_{i:05d}",
+      "split": split,                                          # train / val (clip-level)
       "source_image": _load_frame(frames[i], size),
       "target_image": _load_frame(frames[j], size),
       "start_x": c0[0], "start_y": c0[1],
       "end_x": cj[0], "end_y": cj[1],
+      "source_mask": _instance_mask_resized(m0, inst, size),
+      "target_mask": _instance_mask_resized(mj, inst, size),
     }
 
 
@@ -118,19 +125,37 @@ def build_davis_dataset(cfg: HybridConfig, davis_dir: Path,
                         dcfg: Optional[DavisConfig] = None) -> Iterator[dict]:
   dcfg = dcfg or DavisConfig()
   jpeg_root, anno_root = _davis_roots(cfg, davis_dir)
+  available = sorted([d.name for d in jpeg_root.iterdir() if d.is_dir()])
 
-  available = {d.name for d in jpeg_root.iterdir() if d.is_dir()}
-  wanted = dcfg.clips if dcfg.clips is not None else CURATED_PRISTINE
+  if dcfg.use_all_clips:
+    wanted = available
+  else:
+    wanted = [c for c in (dcfg.clips if dcfg.clips is not None else CURATED_PRISTINE)]
   clips = [c for c in wanted if c in available]
   missing = [c for c in wanted if c not in available]
   if missing:
     logger.warning(f"requested clips not in dataset (skipped): {missing}")
-  logger.info(f"DAVIS: {len(clips)} clips")
 
-  kept = 0
+  # CLIP-LEVEL held-out split: reserve holdout_frac of clips ENTIRELY as val. Clip-level (not
+  # frame-level) because frames from one clip are highly correlated -> a frame-level split would
+  # leak. Generalization is only honestly tested on UNSEEN clips.
+  val_clips: set[str] = set()
+  if dcfg.holdout_frac > 0:
+    rng = random.Random(dcfg.holdout_seed)
+    shuffled = clips[:]
+    rng.shuffle(shuffled)
+    n_val = max(1, int(round(dcfg.holdout_frac * len(shuffled))))
+    val_clips = set(shuffled[:n_val])
+    logger.info(f"HELD-OUT val clips ({len(val_clips)}): {sorted(val_clips)}")
+
+  logger.info(f"DAVIS: {len(clips)} clips ({len(clips)-len(val_clips)} train / {len(val_clips)} val)")
+
+  kept_tr, kept_val = 0, 0
   for clip in clips:
-    for triple in extract_pairs(clip, jpeg_root, anno_root, cfg, dcfg):
-      kept += 1
+    split = "val" if clip in val_clips else "train"
+    for triple in extract_pairs(clip, jpeg_root, anno_root, cfg, dcfg, split):
+      if split == "val": kept_val += 1
+      else: kept_tr += 1
       yield triple
-  logger.info(f"DAVIS: yielded {kept} triples from {len(clips)} clips "
+  logger.info(f"DAVIS: yielded {kept_tr} train + {kept_val} val triples "
               f"(gap={dcfg.frame_gap}, stride={dcfg.stride})")

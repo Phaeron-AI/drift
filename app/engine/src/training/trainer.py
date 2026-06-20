@@ -23,15 +23,17 @@ class Trainer:
     model: HybridSpatialDiffusion,
     dataset,
     lr: float = 1e-4,
+    batch_size: int = 4,           
     accum_steps: int = 8,
     mask_weight: float = 4.0,
     temporal_weight: float = 0.0,
     ckpt_dir: Path = Path("checkpoints"),
     ckpt_every: int = 500,
-    ema_beta: float = 0.98,        # EMA smoothing for the logged loss (higher = smoother)
+    ema_beta: float = 0.98,
   ) -> None:
     self.cfg = cfg
     self.model = model
+    self.batch_size = batch_size
     self.accum_steps = accum_steps
     self.mask_weight = mask_weight
     self.temporal_weight = temporal_weight
@@ -41,13 +43,15 @@ class Trainer:
     self.vram = VRAMManager(cfg)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # EMA of the loss: cancels the per-step timestep variance so the TREND is readable.
-    # raw batch-1 loss swings wildly by sampled t; the EMA is the curve you actually watch.
     self.ema_beta = ema_beta
     self.ema_loss: Optional[float] = None
 
-    self.loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
+    # batch_size>1 averages multiple timesteps per step -> smoother, READABLE loss.
+    self.loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0,
+                             drop_last=(batch_size > 1))
     self.optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=lr)
+    logger.info(f"Trainer: batch_size={batch_size} accum_steps={accum_steps} "
+                f"(effective batch {batch_size * accum_steps})")
 
   def _noise_batch(self, target_latent) -> tuple[Tensor, ...]:
     B = target_latent.shape[0]
@@ -63,10 +67,11 @@ class Trainer:
     device = self.cfg.device
     compute_dtype = self.cfg.compute_dtype
 
-    source_latent = batch["source"].to(device, compute_dtype)   # [1,4,h,w] clean reference
-    target_latent = batch["target"].to(device, compute_dtype)   # [1,4,h,w] object to denoise
-    mask = batch["mask"].to(device)                             # [1,1,H,W]
-    trajectory = batch["trajectory"].to(device, compute_dtype)  # [1,2] normalized
+    source_latent = batch["source"].to(device, compute_dtype)   # [B,4,h,w]
+    target_latent = batch["target"].to(device, compute_dtype)   # [B,4,h,w]
+    mask = batch["mask"].to(device)                             # [B,1,H,W] SOURCE (model input)
+    loss_mask = batch["loss_mask"].to(device)                   # [B,1,H,W] UNION (loss weight)
+    trajectory = batch["trajectory"].to(device, compute_dtype)  # [B,2]
     text_embeds = batch.get("text_embeds", None)
     if text_embeds is not None:
       text_embeds = text_embeds.to(device, compute_dtype)
@@ -75,7 +80,7 @@ class Trainer:
       noisy, noise, t = self._noise_batch(target_latent)
       noise_pred = self.model(noisy, t, trajectory, mask, source_latent, text_embeds)
 
-      recon = l1_l2_reconstruction_loss(noise_pred, noise, mask, self.mask_weight)
+      recon = l1_l2_reconstruction_loss(noise_pred, noise, loss_mask, self.mask_weight)
       temporal = temporal_consistency_loss(noise_pred.unsqueeze(1), noise.unsqueeze(1))
       loss = recon + self.temporal_weight * temporal
 
@@ -100,7 +105,6 @@ class Trainer:
       for batch in self.loader:
         loss_val = self._step(batch)
 
-        # update EMA every step (not just on log steps) so it reflects the full history
         if self.ema_loss is None:
           self.ema_loss = loss_val
         else:
@@ -108,9 +112,7 @@ class Trainer:
 
         if self.global_step % 50 == 0:
           self.vram.report(f"step {self.global_step}")
-          logger.info(
-            f"step {self.global_step} | loss {loss_val:.4f} | ema {self.ema_loss:.4f}"
-          )
+          logger.info(f"step {self.global_step} | loss {loss_val:.4f} | ema {self.ema_loss:.4f}")
 
         self.global_step += 1
         if self.global_step % self.ckpt_every == 0:
@@ -140,19 +142,15 @@ class Trainer:
     if not path.exists():
       logger.warning(f"Checkpoint not found at {path}. Starting from scratch.")
       return
-
     logger.info(f"Loading checkpoint from {path}...")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-
     missing_keys, unexpected_keys = self.model.load_state_dict(
       checkpoint["model_state_dict"], strict=False
     )
     if unexpected_keys:
       logger.warning(f"Found {len(unexpected_keys)} unexpected keys in checkpoint.")
     logger.info("Model trainable weights restored.")
-
     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     logger.info("Optimizer state restored.")
-
     self.global_step = checkpoint["global_step"]
     logger.info(f"Resumed training state -> step {self.global_step}")
