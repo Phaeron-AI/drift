@@ -22,10 +22,18 @@ from __future__ import annotations
 #
 # Drops into the existing pipeline: yields the SAME triple dict as davis_adapter (id, split,
 # source/target_image, start/end x/y, source/target_mask), so precompute/train are unchanged.
+#
+# RESILIENCE: streaming ~1024 shards from gs:// over a long run WILL hit transient network
+# failures (DNS blips, getaddrinfo, aborted reads). The stream is deterministic (no file
+# shuffle), so on a transient error we re-open and ds.skip() past videos already consumed and
+# resume, with bounded backoff. This wraps ONLY the iteration -- the pair-selection logic below
+# (axis, filters, seeded RNG) is untouched, so cache contents are identical with or without a
+# retry. (skip() re-reads shards up to the resume point on failure -- a cost paid only on error.)
 # =============================================================================
 
 import logging
 import random
+import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
@@ -49,6 +57,7 @@ class MoviConfig:
   min_visible_px: int = 200       # object must occupy >= this many px in BOTH frames
   split: str = "train"            # "train" | "test" (test = held-out objects+backgrounds)
   seed: int = 0                   # local RNG seed -> reproducible pair selection across runs
+  max_retries: int = 6            # transient-stream retries before giving up (exp backoff, cap 30s)
 
 
 def _resize_frame(arr_uint8: np.ndarray, size: int) -> torch.Tensor:
@@ -78,70 +87,103 @@ def _pick_object(seg_i: np.ndarray, vis_i, vis_j, min_vis: int) -> Optional[int]
   return None
 
 
+def _emit_pairs(ex, cfg: HybridConfig, mcfg: MoviConfig, rng: random.Random) -> Iterator[dict]:
+  # Per-video pair extraction. Pure CPU/numpy -- no network -- so a video is processed atomically
+  # once fetched. All gated logic (axis unpack, filters, seeded shuffle) lives here, unchanged.
+  size = cfg.img_size
+  video = ex["video"]                                   # [24,256,256,3] uint8
+  seg = ex["segmentations"][..., 0]                     # [24,256,256] uint8 (drop channel)
+  img_pos = ex["instances"]["image_positions"]          # [k,24,2] normalized (x,col),(y,row)
+  vis = ex["instances"]["visibility"]                   # [k,24]
+  n_frames = video.shape[0]
+  vid_name = int(ex["metadata"]["video_name"])
+
+  starts = list(range(0, n_frames - mcfg.frame_gap))
+  rng.shuffle(starts)
+  made = 0
+  for i in starts:
+    if made >= mcfg.pairs_per_video:
+      break
+    j = i + mcfg.frame_gap
+    inst_id = _pick_object(seg[i], vis[:, i], vis[:, j], mcfg.min_visible_px)
+    if inst_id is None:
+      continue
+    k = inst_id - 1
+    # AXIS: image_positions is (x, y) = (col, row), verified against mask centroid. Unpack
+    # x first, y second -- do NOT flip to (y, x) on the strength of the doc alone.
+    xi, yi = img_pos[k, i]
+    xj, yj = img_pos[k, j]
+    # REJECT off-frame centers: MOVi objects get tossed and can leave the view, where
+    # image_positions extrapolates outside [0,1] -> nonsense "teleport" trajectories. Require
+    # both centers comfortably inside the frame (small margin) so the grab point and target
+    # are real on-screen positions. (Caught by smoke test: a (565,150) grab = norm 1.1, off-frame.)
+    m = 0.02
+    if not (m <= xi <= 1 - m and m <= yi <= 1 - m and m <= xj <= 1 - m and m <= yj <= 1 - m):
+      continue
+    dx, dy = float(xj - xi), float(yj - yi)
+    disp = (dx * dx + dy * dy) ** 0.5
+    if disp < mcfg.min_disp_norm:
+      continue
+
+    sx, sy = float(xi) * size, float(yi) * size         # img_size-space grab point (x, y)
+    ex_, ey_ = float(xj) * size, float(yj) * size
+    src_mask = ((seg[i] == inst_id).astype(np.uint8) * 255)
+    tgt_mask = ((seg[j] == inst_id).astype(np.uint8) * 255)
+
+    yield {
+      "id": f"movic_{mcfg.split}_{vid_name:06d}_{i:02d}_{inst_id}",
+      "split": "val" if mcfg.split == "test" else "train",
+      "source_image": _resize_frame(video[i], size),
+      "target_image": _resize_frame(video[j], size),
+      "start_x": sx, "start_y": sy, "end_x": ex_, "end_y": ey_,
+      "source_mask": _resize_mask(src_mask, size),
+      "target_mask": _resize_mask(tgt_mask, size),
+    }
+    made += 1
+
+
 def build_movi_dataset(cfg: HybridConfig, mcfg: Optional[MoviConfig] = None) -> Iterator[dict]:
+  import tensorflow as tf
   import tensorflow_datasets as tfds
   mcfg = mcfg or MoviConfig()
-  size = cfg.img_size
 
   logger.info(f"MOVi: loading {mcfg.variant} split={mcfg.split} from {mcfg.data_dir}")
   ds = tfds.load(mcfg.variant, data_dir=mcfg.data_dir, split=mcfg.split)
   if mcfg.max_videos:
-    ds = ds.take(mcfg.max_videos) # type: ignore
+    ds = ds.take(mcfg.max_videos)  # type: ignore
 
   rng = random.Random(mcfg.seed)  # local, seeded -> deterministic pair selection (not global RNG)
-  n_videos, n_pairs = 0, 0
-  for ex in tfds.as_numpy(ds):
-    n_videos += 1
-    video = ex["video"]                                   # [24,256,256,3] uint8
-    seg = ex["segmentations"][..., 0]                     # [24,256,256] uint8 (drop channel)
-    img_pos = ex["instances"]["image_positions"]          # [k,24,2] normalized (x,col),(y,row)
-    vis = ex["instances"]["visibility"]                   # [k,24]
-    n_frames = video.shape[0]
-    vid_name = int(ex["metadata"]["video_name"])
 
-    starts = list(range(0, n_frames - mcfg.frame_gap))
-    rng.shuffle(starts)
-    made = 0
-    for i in starts:
-      if made >= mcfg.pairs_per_video:
-        break
-      j = i + mcfg.frame_gap
-      inst_id = _pick_object(seg[i], vis[:, i], vis[:, j], mcfg.min_visible_px)
-      if inst_id is None:
-        continue
-      k = inst_id - 1
-      # AXIS: image_positions is (x, y) = (col, row), verified against mask centroid. Unpack
-      # x first, y second -- do NOT flip to (y, x) on the strength of the doc alone.
-      xi, yi = img_pos[k, i]
-      xj, yj = img_pos[k, j]
-      # REJECT off-frame centers: MOVi objects get tossed and can leave the view, where
-      # image_positions extrapolates outside [0,1] -> nonsense "teleport" trajectories. Require
-      # both centers comfortably inside the frame (small margin) so the grab point and target
-      # are real on-screen positions. (Caught by smoke test: a (565,150) grab = norm 1.1, off-frame.)
-      m = 0.02
-      if not (m <= xi <= 1 - m and m <= yi <= 1 - m and m <= xj <= 1 - m and m <= yj <= 1 - m):
-        continue
-      dx, dy = float(xj - xi), float(yj - yi)
-      disp = (dx * dx + dy * dy) ** 0.5
-      if disp < mcfg.min_disp_norm:
-        continue
+  # Transient GCS/network errors surface as these tf.errors; OutOfRangeError is NORMAL end-of-stream
+  # (let it stop the for-loop) and is deliberately NOT caught here.
+  TRANSIENT = (
+    tf.errors.FailedPreconditionError,
+    tf.errors.UnavailableError,
+    tf.errors.InternalError,
+    tf.errors.AbortedError,
+    tf.errors.DataLossError,
+  )
 
-      sx, sy = float(xi) * size, float(yi) * size         # img_size-space grab point (x, y)
-      ex_, ey_ = float(xj) * size, float(yj) * size
-      src_mask = ((seg[i] == inst_id).astype(np.uint8) * 255)
-      tgt_mask = ((seg[j] == inst_id).astype(np.uint8) * 255)
-
-      yield {
-        "id": f"movic_{mcfg.split}_{vid_name:06d}_{i:02d}_{inst_id}",
-        "split": "val" if mcfg.split == "test" else "train",
-        "source_image": _resize_frame(video[i], size),
-        "target_image": _resize_frame(video[j], size),
-        "start_x": sx, "start_y": sy, "end_x": ex_, "end_y": ey_,
-        "source_mask": _resize_mask(src_mask, size),
-        "target_mask": _resize_mask(tgt_mask, size),
-      }
-      made += 1
-      n_pairs += 1
+  n_videos, n_pairs, attempt = 0, 0, 0
+  while True:
+    try:
+      stream = ds.skip(n_videos) if n_videos else ds  # type: ignore   # resume past already-consumed videos
+      for ex in tfds.as_numpy(stream):
+        n_videos += 1                                  # counts videos FULLY fetched (post network)
+        for triple in _emit_pairs(ex, cfg, mcfg, rng):
+          n_pairs += 1
+          yield triple
+      break                                            # clean end-of-stream
+    except TRANSIENT as e:
+      attempt += 1
+      if attempt > mcfg.max_retries:
+        logger.error(f"MOVi stream: giving up after {attempt} retries at video {n_videos}: "
+                     f"{type(e).__name__}")
+        raise
+      wait = min(2 ** attempt, 30)
+      logger.warning(f"MOVi stream: transient read error at video {n_videos} "
+                     f"(retry {attempt}/{mcfg.max_retries} in {wait}s): {type(e).__name__}")
+      time.sleep(wait)
 
   logger.info(f"MOVi: {n_pairs} triples from {n_videos} videos "
               f"(variant={mcfg.variant}, split={mcfg.split}, gap={mcfg.frame_gap})")
