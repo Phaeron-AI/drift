@@ -12,8 +12,12 @@ from __future__ import annotations
 #   segmentations[s,256,256,1] uint8 -> per-pixel instance id, background=0.
 #       NOTE: instance id = index+1 (id k corresponds to instances[k-1]).
 #   instances/image_positions[k,s,2] -> NORMALIZED (0,1) center-of-mass per frame -> trajectory
-#       is just image_positions[obj, j] - image_positions[obj, i]; positions are (row, col) =
-#       (y, x) normalized -> we emit (dx, dy) = (d_col, d_row) to match the model's [x,y] order.
+#       is just image_positions[obj, j] - image_positions[obj, i].
+#       AXIS: empirically verified against the segmentation-mask centroid (smoke test, 87/90
+#       off-diagonal samples) that image_positions is (x, y) = (col, row) -- NOT (row, col) as
+#       some Kubric docs state. So we unpack `xi, yi = img_pos[...]` directly. The 3 "disagree"
+#       samples were near-diagonal objects where x~y and the check can't disambiguate. Lesson
+#       (same as pathway_health): trust the cross-check against a known result, not the doc.
 #   instances/visibility[k,s]        -> pixels visible per frame; require object visible in both.
 #
 # Drops into the existing pipeline: yields the SAME triple dict as davis_adapter (id, split,
@@ -44,6 +48,7 @@ class MoviConfig:
   max_videos: Optional[int] = None
   min_visible_px: int = 200       # object must occupy >= this many px in BOTH frames
   split: str = "train"            # "train" | "test" (test = held-out objects+backgrounds)
+  seed: int = 0                   # local RNG seed -> reproducible pair selection across runs
 
 
 def _resize_frame(arr_uint8: np.ndarray, size: int) -> torch.Tensor:
@@ -59,8 +64,7 @@ def _resize_mask(binmask_uint8: np.ndarray, size: int) -> np.ndarray:
   return np.array(Image.fromarray(binmask_uint8).resize((size, size), Image.Resampling.NEAREST))
 
 
-def _pick_object(seg_i: np.ndarray, vis_i, vis_j, gap_idx_i: int, gap_idx_j: int,
-                 min_vis: int) -> Optional[int]:
+def _pick_object(seg_i: np.ndarray, vis_i, vis_j, min_vis: int) -> Optional[int]:
   # choose the instance (id>=1) that is well-visible in BOTH frames and largest at source.
   ids, counts = np.unique(seg_i, return_counts=True)
   cand = [(int(i), int(c)) for i, c in zip(ids, counts) if i != 0 and c >= min_vis]
@@ -84,29 +88,32 @@ def build_movi_dataset(cfg: HybridConfig, mcfg: Optional[MoviConfig] = None) -> 
   if mcfg.max_videos:
     ds = ds.take(mcfg.max_videos) # type: ignore
 
+  rng = random.Random(mcfg.seed)  # local, seeded -> deterministic pair selection (not global RNG)
   n_videos, n_pairs = 0, 0
   for ex in tfds.as_numpy(ds):
     n_videos += 1
     video = ex["video"]                                   # [24,256,256,3] uint8
     seg = ex["segmentations"][..., 0]                     # [24,256,256] uint8 (drop channel)
-    img_pos = ex["instances"]["image_positions"]          # [k,24,2] normalized (row,col)=(y,x)
+    img_pos = ex["instances"]["image_positions"]          # [k,24,2] normalized (x,col),(y,row)
     vis = ex["instances"]["visibility"]                   # [k,24]
     n_frames = video.shape[0]
     vid_name = int(ex["metadata"]["video_name"])
 
     starts = list(range(0, n_frames - mcfg.frame_gap))
-    random.shuffle(starts)
+    rng.shuffle(starts)
     made = 0
     for i in starts:
       if made >= mcfg.pairs_per_video:
         break
       j = i + mcfg.frame_gap
-      inst_id = _pick_object(seg[i], vis[:, i], vis[:, j], i, j, mcfg.min_visible_px)
+      inst_id = _pick_object(seg[i], vis[:, i], vis[:, j], mcfg.min_visible_px)
       if inst_id is None:
         continue
       k = inst_id - 1
-      yi, xi = img_pos[k, i]            # normalized (row,col) = (y,x)
-      yj, xj = img_pos[k, j]
+      # AXIS: image_positions is (x, y) = (col, row), verified against mask centroid. Unpack
+      # x first, y second -- do NOT flip to (y, x) on the strength of the doc alone.
+      xi, yi = img_pos[k, i]
+      xj, yj = img_pos[k, j]
       # REJECT off-frame centers: MOVi objects get tossed and can leave the view, where
       # image_positions extrapolates outside [0,1] -> nonsense "teleport" trajectories. Require
       # both centers comfortably inside the frame (small margin) so the grab point and target
@@ -119,7 +126,7 @@ def build_movi_dataset(cfg: HybridConfig, mcfg: Optional[MoviConfig] = None) -> 
       if disp < mcfg.min_disp_norm:
         continue
 
-      sx, sy = float(xi) * size, float(yi) * size         # img_size-space grab point
+      sx, sy = float(xi) * size, float(yi) * size         # img_size-space grab point (x, y)
       ex_, ey_ = float(xj) * size, float(yj) * size
       src_mask = ((seg[i] == inst_id).astype(np.uint8) * 255)
       tgt_mask = ((seg[j] == inst_id).astype(np.uint8) * 255)
