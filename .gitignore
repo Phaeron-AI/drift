@@ -11,3 +11,12 @@ venv/
 
 # Cache Directories
 cache/
+overfit_cache/
+recon_cache/
+joint_cache/
+movi_cache/
+
+# Vizualization Frames
+viz/
+
+# D:/Phaeron/drift/app/engine/src/data_raw/DAVIS/JPEGImages/480p/bear/00000.jpg
