@@ -30,7 +30,6 @@ def save_mp4(cine: Cinemagraph, path: str) -> None:
 
 
 def apply_watermark(cine: Cinemagraph, *, tier: str) -> Cinemagraph:
-  """Stamps a watermark on trial exports without polluting the renderer."""
   # HINT: Pro tier skips this completely
   if tier.lower() == "pro":
       return cine
