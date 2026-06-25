@@ -33,3 +33,11 @@ def sway_field(height: int, width: int, amplitude: float = 4.0, wavelength: floa
 
 def apply_region(M: np.ndarray, region: np.ndarray) -> np.ndarray:
   return M * region[..., None]
+
+def flow_field(height: int, width: int, angle_deg: float = 90.0,
+               speed: float = 4.0) -> np.ndarray:
+  theta = np.deg2rad(angle_deg)
+  M = zero_field(height, width)
+  M[..., 0] = speed * np.sin(theta)   # vy
+  M[..., 1] = speed * np.cos(theta)   # vx
+  return M
