@@ -8,7 +8,7 @@ class RenderConfig:
   fps: float = 24.0
   amplitude_px: float = 4.5
   wavelength_px: float = 140.0
-  feather_sigme: float = 5.0
+  feather_sigma: float = 5.0
   edge_mode: str = "reflect"
   device: str = "cpu"
   # seed: float = 42
