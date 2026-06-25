@@ -6,17 +6,19 @@ import warnings
 from ..core.fields import apply_region, sway_field, zero_field
 from ..types import Image, MotionField, Region
 
+
 class AnalyticMotionEstimator:
-  def __init__(self, amplitude_px: float = 4.5, wavelength_px: float = 140.0)-> None:
+  def __init__(self, amplitude_px: float = 4.5, wavelength_px: float = 140.0) -> None:
     self._amp = amplitude_px
     self._wave = wavelength_px
-  
-  def estimate(self, image: Image, region: Region)-> MotionField:
+
+  def estimate(self, image: Image, region: Region) -> MotionField:
     h, w = region.mask.shape
     if region.is_locked or region.strength == 0.0:
       return zero_field(h, w)
     M = sway_field(h, w, amplitude=self._amp * region.strength, wavelength=self._wave)
     return apply_region(M, region.mask)
+
 
 class LearnedMotionEstimator:
   def __init__(self, checkpoint: str, device: str = "cuda", div_threshold: float = 0.5) -> None:
@@ -27,40 +29,55 @@ class LearnedMotionEstimator:
 
     try:
       self.model = torch.jit.load(checkpoint, map_location=self.device)
-      self.model.save()
+      self.model.eval()
     except Exception as e:
-      raise RuntimeError(f"Failed to load motion model from {checkpoint}. Ensure it's a valid PyTorch model format. Error: {e}")
-    
-  def estimate(self, image: Image, region: Region)-> MotionField:
+      raise RuntimeError(
+        f"Failed to load motion model from {checkpoint}. "
+        f"Ensure it's a valid TorchScript file. Error: {e}"
+      )
+
+  def estimate(self, image: Image, region: Region) -> MotionField:
     import torch
 
     h, w = region.mask.shape
     if region.is_locked or region.strength == 0.0:
       return zero_field(h, w)
-    
-    img_t = torch.from_numpy(image).float().permute(2, 0, 1)  # (3, H, W)
+
+    img_t = torch.from_numpy(image).float().permute(2, 0, 1)   # (3, H, W)
     mask_t = torch.from_numpy(region.mask).float().unsqueeze(0)  # (1, H, W)
     x = torch.cat([img_t, mask_t], dim=0).unsqueeze(0).to(self.device)
 
     with torch.no_grad():
       pred_t = self.model(x)
-    
-    M = pred_t.squeeze(0).cpu().numpy()
 
+    M = pred_t.squeeze(0).cpu().numpy()        # (2, H, W) channels-first
+    M = np.transpose(M, (1, 2, 0))             # -> (H, W, 2) to match the pipeline
     M = M * region.strength
 
-    dy_dy, _ = np.gradient(M[0], axis=(0, 1))
-    _, dx_dx = np.gradient(M[1], axis=(0, 1))
-
-    divergence = dx_dx + dy_dy
-    max_div = np.max(divergence)
+    vy, vx = M[..., 0], M[..., 1]
+    divergence = np.gradient(vx, axis=1) + np.gradient(vy, axis=0)
+    max_div = float(np.max(np.abs(divergence)))   # abs: compression also tears, not just expansion
 
     if max_div > self.div_threshold:
       scale_factor = self.div_threshold / max_div
       warnings.warn(
-        f"Region '{region.name}': Large divergence detected ({max_div:.3f} > {self.div_threshold}). "
-        f"Down-scaling field by {scale_factor:.2f}x to prevent disocclusion tearing."
+        f"Region '{region.name}': large divergence ({max_div:.3f} > {self.div_threshold}). "
+        f"Down-scaling field by {scale_factor:.2f}x to limit disocclusion tearing."
       )
       M = M * scale_factor
-        
+
+    return apply_region(M, region.mask)
+  
+
+class FlowMotionEstimator: 
+  def __init__(self, angle_deg: float = 90.0, speed: float = 2.0) -> None:
+    self._angle = angle_deg
+    self._speed = speed
+
+  def estimate(self, image: Image, region: Region) -> MotionField:
+    from ..core.fields import flow_field
+    h, w = region.mask.shape
+    if region.is_locked or region.strength == 0.0:
+      return zero_field(h, w)
+    M = flow_field(h, w, angle_deg=self._angle, speed=self._speed * region.strength)
     return apply_region(M, region.mask)
